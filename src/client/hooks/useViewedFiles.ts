@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 
 import {
   type BaseMode,
@@ -37,10 +37,13 @@ export function useViewedFiles(
   repositoryId?: string,
   autoViewedPatterns: string[] = [],
   baseMode?: BaseMode,
+  reloadVersion?: number,
 ): UseViewedFilesReturn {
   const [viewedFileRecords, setViewedFileRecords] = useState<ViewedFileRecord[]>([]);
   const [loadedViewedFilesKey, setLoadedViewedFilesKey] = useState<string | null>(null);
-  const [fileHashes, setFileHashes] = useState<Map<string, string>>(new Map());
+  // Keyed by DiffFile object so a refetched diff is never hashed from a stale entry
+  const fileHashesRef = useRef(new WeakMap<DiffFile, string>());
+  const lastLoadedViewedFilesKeyRef = useRef<string | null>(null);
   const [changedSinceViewedFiles, setChangedSinceViewedFiles] = useState<Set<string>>(new Set());
   const viewedFilesKey =
     baseCommitish && targetCommitish
@@ -58,38 +61,42 @@ export function useViewedFiles(
     if (!baseCommitish || !targetCommitish || !viewedFilesKey) return;
 
     let cancelled = false;
-
-    const loadedFiles = storageService.getViewedFiles(
-      baseCommitish,
-      targetCommitish,
-      currentCommitHash,
-      branchToHash,
-      repositoryId,
-      baseMode,
-    );
+    // Running again for the comparison that was last loaded means the diff was reloaded
+    const isReload = lastLoadedViewedFilesKeyRef.current === viewedFilesKey;
 
     // Auto-mark generated, deleted, or pattern-matched files as viewed if they
     // are not already marked. Pattern changes are intentionally not reactive here
     // so editing the textarea does not immediately re-mark the current diff.
     const processAutoCollapsedFiles = async () => {
+      // Hash every displayed file once so we can both auto-mark and
+      // hydrate-from-index without recomputing.
+      const hashByPath = new Map<string, string>();
+      await Promise.all(
+        (initialFiles ?? []).map(async (file) => {
+          try {
+            const hash = await generateDiffHash(getDiffContentForHashing(file));
+            hashByPath.set(file.path, hash);
+          } catch (err) {
+            console.error('Failed to generate hash for file:', file.path, err);
+          }
+        }),
+      );
+      if (cancelled) return;
+
+      // Read storage only after hashing, so a file marked viewed meanwhile is
+      // not overwritten when the records are saved below.
+      const loadedFiles = storageService.getViewedFiles(
+        baseCommitish,
+        targetCommitish,
+        currentCommitHash,
+        branchToHash,
+        repositoryId,
+        baseMode,
+      );
       const additions: ViewedFileRecord[] = [];
       let activeRecords: ViewedFileRecord[] = loadedFiles;
 
       if (initialFiles && initialFiles.length > 0) {
-        // Hash every displayed file once so we can both auto-mark and
-        // hydrate-from-index without recomputing.
-        const hashByPath = new Map<string, string>();
-        await Promise.all(
-          initialFiles.map(async (file) => {
-            try {
-              const hash = await generateDiffHash(getDiffContentForHashing(file));
-              hashByPath.set(file.path, hash);
-            } catch (err) {
-              console.error('Failed to generate hash for file:', file.path, err);
-            }
-          }),
-        );
-
         // A stored record whose file no longer hashes to the recorded value was
         // viewed and then edited inside this same comparison range. Un-view it,
         // so its diff is expanded again, and flag it as changed below.
@@ -104,9 +111,12 @@ export function useViewedFiles(
         activeRecords = loadedFiles.filter((record) => !stalePaths.has(record.filePath));
         const knownPaths = new Set(activeRecords.map((f) => f.filePath));
 
-        // Auto-mark generated / deleted / pattern-matched files.
+        // Auto-mark generated / deleted / pattern-matched files. On reload, only
+        // re-mark files whose viewed record just went stale, so a file the user
+        // un-viewed stays un-viewed.
         for (const file of initialFiles) {
           if (knownPaths.has(file.path)) continue;
+          if (isReload && !stalePaths.has(file.path)) continue;
           const shouldAutoMarkViewed =
             file.isGenerated ||
             file.status === 'deleted' ||
@@ -184,6 +194,7 @@ export function useViewedFiles(
       if (!cancelled) {
         setViewedFileRecords(updatedRecords);
         setLoadedViewedFilesKey(viewedFilesKey);
+        lastLoadedViewedFilesKeyRef.current = viewedFilesKey;
       }
     };
 
@@ -200,7 +211,8 @@ export function useViewedFiles(
     repositoryId,
     viewedFilesKey,
     baseMode,
-  ]); // initialFiles and autoViewedPatterns intentionally omitted to run only on diff init
+    reloadVersion,
+  ]); // initialFiles and autoViewedPatterns intentionally omitted to run only on diff init or reload
 
   // Save viewed files to storage
   const saveViewedFiles = useCallback(
@@ -235,19 +247,16 @@ export function useViewedFiles(
   );
 
   // Generate and cache hash for a file
-  const getFileHash = useCallback(
-    async (diffFile: DiffFile): Promise<string> => {
-      const cached = fileHashes.get(diffFile.path);
-      if (cached) return cached;
+  const getFileHash = useCallback(async (diffFile: DiffFile): Promise<string> => {
+    const cached = fileHashesRef.current.get(diffFile);
+    if (cached) return cached;
 
-      const content = getDiffContentForHashing(diffFile);
-      const hash = await generateDiffHash(content);
+    const content = getDiffContentForHashing(diffFile);
+    const hash = await generateDiffHash(content);
 
-      setFileHashes((prev) => new Map(prev).set(diffFile.path, hash));
-      return hash;
-    },
-    [fileHashes],
-  );
+    fileHashesRef.current.set(diffFile, hash);
+    return hash;
+  }, []);
 
   // Check if file content has changed
   const isFileContentChanged = useCallback(
@@ -349,7 +358,6 @@ export function useViewedFiles(
   // Clear all viewed files
   const clearViewedFiles = useCallback(() => {
     saveViewedFiles([]);
-    setFileHashes(new Map());
     setChangedSinceViewedFiles(new Set());
     storageService.clearViewedHashIndex(repositoryId);
   }, [saveViewedFiles, repositoryId]);
